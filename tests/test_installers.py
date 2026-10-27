@@ -65,7 +65,7 @@ def test_user_install_is_idempotent_and_does_not_duplicate_hooks(
     elif runtime is Runtime.GOOSE:
         assert json.loads(hook.read_text(encoding="utf-8"))["lifecycle_automation"] is False
     else:
-        expected_hooks = 7 if runtime in {Runtime.GROK, Runtime.ANTIGRAVITY} else 5
+        expected_hooks = {Runtime.GROK: 8, Runtime.ANTIGRAVITY: 7}.get(runtime, 5)
         assert _brief_spec_hook_entry_count(hook) == expected_hooks
 
 
@@ -298,3 +298,27 @@ def test_multi_runtime_setup_rolls_back_every_runtime(
         install_runtimes([Runtime.CODEX, Runtime.CLAUDE])
     assert codex_target.read_text(encoding="utf-8") == "before-codex"
     assert claude_target.read_text(encoding="utf-8") == "before-claude"
+
+
+def test_upgrade_replaces_capability_file_written_by_an_older_version(
+    isolated_homes: dict[str, Path],
+) -> None:
+    import json
+
+    from briefspec.installers import install_runtime
+    from briefspec.models import Runtime
+
+    install_runtime(Runtime.GOOSE, scope="user")
+    receipt = json.loads(
+        (isolated_homes["state"] / "receipts" / "goose-user.json").read_text(encoding="utf-8")
+    )
+    capability = next(
+        Path(item["path"])
+        for item in receipt["files"]
+        if item["path"].endswith("capabilities.json")
+    )
+    value = json.loads(capability.read_text(encoding="utf-8"))
+    value["brief_spec_version"] = "0.5.0"
+    capability.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    install_runtime(Runtime.GOOSE, scope="user")
+    assert json.loads(capability.read_text(encoding="utf-8"))["brief_spec_version"] != "0.5.0"

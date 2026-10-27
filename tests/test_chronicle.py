@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import zipfile
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 from brief_spec_chronicle.derive import build_snapshot, validate_snapshot
@@ -17,8 +20,14 @@ from brief_spec_chronicle.operations import (
     restore_project,
     review_lesson,
 )
-from brief_spec_chronicle.rendering import export_snapshot, verify_export
+from brief_spec_chronicle.rendering import (
+    deterministic_zip,
+    export_snapshot,
+    verify_export,
+)
+from brief_spec_chronicle.sources import normalize_source_event
 from brief_spec_chronicle.storage import (
+    atomic_external_write,
     delete_project,
     ingest_event,
     init_project,
@@ -29,6 +38,9 @@ from brief_spec_chronicle.storage import (
 )
 from jsonschema.validators import validator_for
 from referencing import Registry, Resource
+
+from briefspec.artifacts import sha256_bytes
+from briefspec.delivery import load_delivery, validate_delivery
 
 TIMES = [f"2026-08-14T12:{minute:02}:00+00:00" for minute in range(20)]
 ROOT = Path(__file__).resolve().parents[1]
@@ -149,6 +161,28 @@ def _seed(project: Path) -> None:
     ]
     for value in values:
         ingest_event(project, value, source_system="test", observed_at=value["occurred_at"])
+
+
+def test_external_write_without_fchmod_preserves_public_output_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    parent = tmp_path / "public"
+    parent.mkdir(mode=0o755)
+    parent_mode = parent.stat().st_mode & 0o777
+    output = parent / "snapshot.json"
+
+    atomic_external_write(output, b"original")
+    assert output.read_bytes() == b"original"
+    with pytest.raises(FileExistsError):
+        atomic_external_write(output, b"unapproved")
+    assert output.read_bytes() == b"original"
+
+    atomic_external_write(output, b"replacement", force=True)
+    assert output.read_bytes() == b"replacement"
+    if os.name != "nt":
+        assert parent.stat().st_mode & 0o777 == parent_mode
+        assert output.stat().st_mode & 0o777 == 0o644
 
 
 def test_project_lifecycle_snapshot_and_deterministic_exports(
@@ -596,6 +630,152 @@ def test_cross_harness_correlation_deduplicates_one_material_transition(
     assert len(list(iter_events(registration["project_id"]))) == 1
 
 
+@pytest.fixture
+def private_reference_delivery(outcome_text: Callable[..., str]) -> dict[str, Any]:
+    locator = "https://private.example.com/artifact"
+    delivery, _ = load_delivery(
+        outcome_text(
+            status="REVIEW",
+            human_action="Review the private evidence.",
+            proof=(f"[reported/info kind=url] {locator} — Evidence awaits review.",),
+        )
+    )
+    delivery["source"]["created_at"] = TIMES[0]
+    delivery["artifacts"] = [
+        {
+            "artifact_id": "private-report",
+            "role": "evidence",
+            "locator": locator,
+            "media_type": "application/json",
+            "access": "private",
+            "sha256": "a" * 64,
+            "expires_at": TIMES[9],
+        }
+    ]
+    assert validate_delivery(delivery).valid
+    return delivery
+
+
+def test_chronicle_private_evidence_roundtrip(
+    chronicle_project: tuple[Path, dict[str, object]],
+    private_reference_delivery: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _ = chronicle_project
+    ingest_event(
+        project,
+        normalize_source_event(private_reference_delivery, source_system="brief-spec"),
+        source_system="brief-spec",
+        observed_at=TIMES[0],
+    )
+    snapshot = build_snapshot(project, created_at=TIMES[5])
+    records = snapshot["evidence"]
+    assert all(record["access"] == "private" for record in records)
+    assert any(
+        record["content_sha256"] == "a" * 64 and record["expires_at"] == TIMES[9]
+        for record in records
+    )
+    output = tmp_path / "imported-private-evidence"
+    export_snapshot(snapshot, output, formats={"markdown", "json", "html"})
+
+    def no_network(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("Imported private evidence must not trigger network access")
+
+    monkeypatch.setattr("brief_spec_chronicle.rendering.resolve_public_url", no_network)
+    verified = verify_export(output, level="resolved", workspace=project)
+    assert verified["status"] == "WARN", verified
+    assert any("Private evidence URL" in warning for warning in verified["warnings"])
+
+
+def test_chronicle_evidence_metadata_preserved(
+    chronicle_project: tuple[Path, dict[str, object]],
+    private_reference_delivery: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    project, _ = chronicle_project
+    report = project / "report.json"
+    report.write_text('{"reviewed":true}\n', encoding="utf-8")
+    artifact = private_reference_delivery["artifacts"][0]
+    artifact.update(locator="file:report.json", sha256=sha256_bytes(report.read_bytes()))
+    private_reference_delivery["provenance"] = [
+        {
+            "provider": "retained-report",
+            "locator": private_reference_delivery["brief"]["proof"][0]["locator"],
+            "retrieved_at": TIMES[0],
+            "basis": "reported",
+            "access": "private",
+            "content_sha256": "b" * 64,
+        }
+    ]
+    assert validate_delivery(private_reference_delivery).valid
+    ingest_event(
+        project,
+        normalize_source_event(private_reference_delivery, source_system="brief-spec"),
+        source_system="brief-spec",
+        observed_at=TIMES[0],
+    )
+    snapshot = build_snapshot(project, created_at=TIMES[5])
+    assert any(record["content_sha256"] == "b" * 64 for record in snapshot["evidence"])
+    output = tmp_path / "imported-file-evidence"
+    export_snapshot(snapshot, output, formats={"markdown", "json", "html"})
+    assert (
+        verify_export(output, level="resolved", workspace=project, offline=True)["status"] == "WARN"
+    )
+
+    report.write_text('{"reviewed":false}\n', encoding="utf-8")
+
+    verified = verify_export(output, level="resolved", workspace=project, offline=True)
+    assert verified["status"] == "FAIL", verified
+    assert any("hash mismatch" in error for error in verified["errors"])
+
+
+def test_chronicle_repeated_reference_restrictions(
+    chronicle_project: tuple[Path, dict[str, object]],
+    private_reference_delivery: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _ = chronicle_project
+    ingest_event(
+        project,
+        normalize_source_event(private_reference_delivery, source_system="brief-spec"),
+        source_system="brief-spec",
+        observed_at=TIMES[0],
+    )
+    private_reference_delivery["source"]["created_at"] = TIMES[2]
+    private_reference_delivery["artifacts"][0].update(
+        access="public", sha256="b" * 64, expires_at=None
+    )
+    ingest_event(
+        project,
+        normalize_source_event(private_reference_delivery, source_system="brief-spec"),
+        source_system="brief-spec",
+        observed_at=TIMES[2],
+    )
+    snapshot = build_snapshot(project, created_at=TIMES[10])
+    records = snapshot["evidence"]
+    assert all(record["access"] == "private" for record in records)
+    assert {
+        record["content_sha256"]: record["expires_at"]
+        for record in records
+        if record["content_sha256"]
+    } == {"a" * 64: TIMES[9], "b" * 64: None}
+    assert {source_id for record in records for source_id in record["source_event_ids"]} == set(
+        snapshot["source_event_ids"]
+    )
+    output = tmp_path / "repeated-evidence"
+    export_snapshot(snapshot, output, formats={"markdown", "json", "html"})
+
+    def no_network(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("A later public observation must not widen private access")
+
+    monkeypatch.setattr("brief_spec_chronicle.rendering.resolve_public_url", no_network)
+    verified = verify_export(output, level="resolved", workspace=project)
+    assert verified["status"] == "FAIL", verified
+    assert any("expired" in error for error in verified["errors"])
+
+
 def test_private_and_expired_evidence_remain_visible_without_network_access(
     chronicle_project: tuple[Path, dict[str, object]],
     tmp_path: Path,
@@ -758,3 +938,59 @@ def test_doctor_rebuilds_a_missing_derived_index(
     assert index.is_file()
     if os.name != "nt":
         assert project_record.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("reference_access", ["restricted", ["private"]])
+def test_chronicle_repeated_reference_restrictions_invalid_access(
+    chronicle_project: tuple[Path, dict[str, object]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference_access: object,
+) -> None:
+    project, _ = chronicle_project
+    locator = "https://example.com/restricted"
+    for index, access in enumerate((reference_access, "public")):
+        event = _event(
+            "EVIDENCE_ADDED",
+            "Observed artifact access",
+            TIMES[index],
+            evidence=[locator],
+            details={"evidence": [{"evidence_id": locator, "access": access}]},
+        )
+        event["access"] = "public"
+        ingest_event(project, event, source_system="test", observed_at=TIMES[index])
+
+    snapshot = build_snapshot(project, created_at=TIMES[5])
+    assert [(record["evidence_id"], record["access"]) for record in snapshot["evidence"]] == [
+        (locator, "private")
+    ]
+    output = tmp_path / "unknown-access"
+    export_snapshot(snapshot, output, formats={"json", "html"})
+
+    def no_network(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("Unknown access must not authorize network resolution")
+
+    monkeypatch.setattr("brief_spec_chronicle.rendering.resolve_public_url", no_network)
+    verified = verify_export(output, level="resolved", workspace=project)
+    assert verified["status"] == "WARN", verified
+
+
+def test_external_write_and_zip_do_not_depend_on_unix_only_apis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """os.fchmod is Unix-only, and Windows cannot reopen an open NamedTemporaryFile
+    by name. Neither export path may rely on those behaviors."""
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    target = tmp_path / "out" / "lesson.json"
+    atomic_external_write(target, b'{"lesson": "portable"}')
+    assert json.loads(target.read_text(encoding="utf-8")) == {"lesson": "portable"}
+    assert list(target.parent.glob(".lesson.json.*")) == []
+
+    created_at = "2026-08-14T12:01:00+00:00"
+    payload = {"b.txt": b"second", "a.txt": b"first"}
+    archive = deterministic_zip(payload, created_at)
+    assert archive == deterministic_zip(payload, created_at)
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        assert bundle.namelist() == ["a.txt", "b.txt"]
+        assert bundle.read("b.txt") == b"second"

@@ -27,6 +27,7 @@ from briefspec.delivery import (
     sha256_bytes,
     validate_delivery,
 )
+from briefspec.freshness import freshness
 from briefspec.models import VerificationLevel
 from briefspec.renderers import available_renderers
 
@@ -173,6 +174,19 @@ def _verify_html(path: Path, checks: list[dict[str, Any]]) -> dict[str, Any] | N
     except json.JSONDecodeError as exc:
         _check(checks, "HTML integrity", "FAIL", f"embedded canonical JSON is invalid: {exc}")
         return None
+    try:
+        if not isinstance(delivery, dict):
+            raise ValueError("canonical delivery must be an object")
+        validation = validate_delivery(delivery)
+        if not validation.valid:
+            raise ValueError("; ".join(validation.errors))
+        expected = render_html(delivery)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        _check(checks, "structure", "FAIL", f"embedded canonical delivery is invalid: {exc}")
+        return None
+    _check(checks, "structure", "PASS", "canonical delivery is valid")
+    for warning in validation.warnings:
+        _check(checks, "quality warning", "WARN", warning)
     actual = canonical_sha256(delivery)
     declared = hash_match.group(1)
     _check(
@@ -180,6 +194,14 @@ def _verify_html(path: Path, checks: list[dict[str, Any]]) -> dict[str, Any] | N
         "HTML integrity",
         "PASS" if actual == declared else "FAIL",
         f"canonical sha256 {actual}",
+    )
+    _check(
+        checks,
+        "HTML rendering",
+        "PASS" if content == expected else "FAIL",
+        "HTML matches the deterministic rendering of canonical delivery"
+        if content == expected
+        else "HTML is not the deterministic rendering of canonical delivery",
     )
     return delivery
 
@@ -669,6 +691,20 @@ def verify_target(
             allow_outside_workspace=allow_outside_workspace,
             allow_large_artifact=allow_large_artifact,
         )
+    if delivery is not None:
+        source = delivery.get("source") if isinstance(delivery.get("source"), dict) else {}
+        state = freshness(source.get("source_revision"), workspace)
+        if state is not None:
+            if state["status"] == "fresh":
+                _check(checks, "freshness", "PASS", f"brief matches HEAD {state['head'][:12]}")
+            else:
+                since = state.get("commits_since")
+                detail = f"brief describes {state['recorded'][:12]}; HEAD is {state['head'][:12]}"
+                if state["status"] == "diverged":
+                    detail += " (that commit is not in HEAD's history)"
+                elif since is not None:
+                    detail += f" ({since} commit(s) later)"
+                _check(checks, "freshness", "WARN", detail)
     if level is VerificationLevel.DELIVERED and not target.name.endswith(".receipt.json"):
         receipt = target.with_suffix(target.suffix + ".receipt.json")
         if receipt.is_file():

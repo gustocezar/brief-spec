@@ -4,30 +4,40 @@
 
 - Python 3.11 or newer
 - One or more supported hosts. Codex, Claude Code, Oh My Pi (OMP), Grok Build,
-  and Kimi Code retain their full `0.5.0` live baseline; the exact current
-  uncommitted worktree has installation and synthetic-probe evidence. GitHub
-  Copilot, Cursor Agent, and Goose are experimental.
+  and Kimi Code are covered by the live host matrix in the
+  [verification record](verification.md). GitHub Copilot, Cursor Agent, and
+  Goose are experimental.
 - `uv` is recommended for isolated tool installation
 
 Brief-Spec has no runtime Python dependencies and performs no network calls from hooks.
 
-## Published and candidate installation
+## Published and checkout installation
 
-The public GitHub release is currently `v0.2.0`. The source checkout is a
-`v0.5.0` candidate and must not be described as published until current
-exact-worktree live gates, hosted CI, GitHub Release, and PyPI evidence all
-pass. The retained five-host baseline is not an exact-current-worktree rerun.
-
-Install the public release:
+The current public release is `v0.6.0`. It is on PyPI and on GitHub, and the PyPI files are
+byte-identical to the wheels and sdists attached to the GitHub release. Install the pinned
+distributions, including the optional renderers:
 
 ```bash
-uv tool install git+https://github.com/luanmorenommaciel/brief-spec.git@v0.2.0
-briefspec install all --scope user
-briefspec doctor all --probe
+uv tool install --force "brief-spec==0.6.0" \
+  --with "brief-spec-renderer-pdf==0.6.0" \
+  --with "brief-spec-renderer-audio==0.6.0"
+brief-spec setup all --scope user --require codex,claude,omp,grok,kimi
+brief-spec doctor all --scope user --probe --all-scopes
 ```
 
-Those commands intentionally use the legacy `v0.2.0` interface. The `briefspec`
-alias remains supported throughout `0.x`, but new installations use `brief-spec`.
+`pip install brief-spec brief-spec-renderer-pdf brief-spec-renderer-audio` works the same way
+inside a virtual environment. The renderers are separate packages, not extras, so
+`brief-spec[pdf]` does not install them. To build from the tagged source instead:
+
+```bash
+uv tool install git+https://github.com/luanmorenommaciel/brief-spec.git@v0.6.0
+```
+
+New installations use the `brief-spec` command. The legacy `briefspec` alias remains
+supported throughout `0.x`.
+
+Chronicle and video remain a separate experimental extension track until they are
+independently published.
 
 Dogfood the complete candidate stack from its checkout. Installing Chronicle
 does not initialize or capture any project:
@@ -43,18 +53,6 @@ uv tool install --force --reinstall \
 brief-spec setup all --scope user --require codex,claude,omp,grok,kimi
 brief-spec doctor all --scope user --probe --all-scopes
 brief-spec-chronicle --version
-```
-
-After `v0.5.0` is published to PyPI, replace the candidate with immutable,
-version-pinned core and renderer distributions. Chronicle and video remain a
-separate experimental extension track until they are independently published:
-
-```bash
-uv tool install --force "brief-spec==0.5.0" \
-  --with "brief-spec-renderer-pdf==0.5.0" \
-  --with "brief-spec-renderer-audio==0.5.0"
-brief-spec setup all --scope user --require codex,claude,omp,grok,kimi
-brief-spec doctor all --scope user --probe --all-scopes
 ```
 
 Install or inspect one host:
@@ -73,6 +71,23 @@ The portable installer copies the three skills, creates a self-contained runtime
 hook configuration, and writes a receipt. It does not require a host executable to be present;
 `doctor` reports a missing executable as a warning so configuration can be prepared ahead of time.
 `setup all` installs detected harnesses only; use `--require` when named absences must fail.
+
+### Codex hook approval
+
+Codex runs a hook only after you approve it. Open Codex once after setup and
+approve the Brief-Spec hooks in `/hooks`. `codex exec` never shows that review
+screen and skips unapproved hooks without an error. Codex ties each approval to
+the exact hook command and its position in `hooks.json`, so a setup that changes
+either one needs a new approval.
+
+```bash
+brief-spec doctor codex --scope user
+```
+
+The `hook trust` line lists any Brief-Spec hook that is not yet approved or has
+changed since approval. Brief-Spec never edits Codex's approval list itself.
+
+### Ownership and upgrades
 
 Upgrade ownership requires both a receipt path and its prior hash; a
 Brief-Spec-looking marker is not ownership. If a receipt-owned skill was edited
@@ -116,9 +131,23 @@ A Claude Code project install writes skills to `.claude/skills/` so the host dis
 exists for the current directory and the user install otherwise; pass `--scope` to force one.
 
 OMP supports skills and lifecycle extensions at user and project scope. Grok Build receives native
-`.grok/skills` assets and a receipt-owned `.grok/hooks/brief-spec.json`. Kimi project setup installs
-skills only; lifecycle automation requires the user-wide managed Brief-Spec plugin, and doctor
-reports that boundary instead of claiming project-scoped hooks.
+`.grok/skills` assets and a receipt-owned `.grok/hooks/brief-spec.json`. Grok ignores the output of
+its prompt hook, so the manifest also registers `PreToolUse`: the first tool call of a classified
+task carries the decision to the model. Grok also loads hooks from `.claude/settings.json` and
+`.cursor/hooks.json` unless its `[compat.claude]` and `[compat.cursor]` hook settings are off. With
+those settings on, a machine that has Brief-Spec installed for Claude or Cursor runs Brief-Spec
+twice per Grok event. Turn them off in `~/.grok/config.toml`:
+
+```toml
+[compat.claude]
+hooks = false
+
+[compat.cursor]
+hooks = false
+```
+
+Kimi project setup installs skills only; lifecycle automation requires the user-wide managed
+Brief-Spec plugin, and doctor reports that boundary instead of claiming project-scoped hooks.
 
 ## Optional download renderers
 
@@ -185,9 +214,12 @@ The repository ships native manifests in addition to the portable installer.
 ### Codex
 
 ```bash
-codex plugin marketplace add luanmorenommaciel/brief-spec --ref v0.5.0
+codex plugin marketplace add luanmorenommaciel/brief-spec
 codex plugin add brief-spec@brief-spec
 ```
+
+The marketplace tracks the default branch; pass a local checkout path instead to pin exact
+bytes. The `v0.6.0` tag marks the released revision.
 
 ### Claude Code
 

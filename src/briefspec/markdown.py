@@ -24,7 +24,7 @@ TYPED_PATTERN = re.compile(
 )
 TYPED_END_MARKER = "<!-- /brief-spec -->"
 _EVIDENCE_TAG = re.compile(
-    r"^\[(?:direct|derived|reported)/(?:pass|fail|info)(?:\s+[^\]]+)?\]\s+",
+    r"^\[(?P<basis>direct|derived|reported)/(?P<result>pass|fail|info)(?:\s+[^\]]+)?\]\s+",
     re.IGNORECASE,
 )
 _EVIDENCE_LOCATOR = re.compile(
@@ -45,6 +45,10 @@ _OUTCOME_SECTION_ORDER = (
     "Next",
     "Open",
 )
+# A DONE brief with nothing left for the human may omit these fields. They are read as the
+# same explicit None values the full form carries, so the canonical object is identical.
+_COMPACT_OPTIONAL_FIELDS = ("Human action", "Gaps", "Next", "Open")
+_MISSING_FIELDS_PREFIX = "Missing required field(s)"
 
 _CHECKPOINT_SECTIONS = {
     CheckpointMode.ORIENT: (
@@ -151,6 +155,14 @@ def _evidence_items(value: Any) -> tuple[str, ...]:
     return (str(value).strip(),)
 
 
+def evidence_tag(item: str) -> tuple[str, str]:
+    """Return (basis, result); untagged evidence counts as reported/info."""
+    match = _EVIDENCE_TAG.match(item.strip())
+    if match is None:
+        return "reported", "info"
+    return match.group("basis").lower(), match.group("result").lower()
+
+
 def _validate_evidence(
     value: Any,
     field_name: str,
@@ -175,6 +187,17 @@ def validate_outcome(text: str) -> ValidationResult:
     if region is None:
         return ValidationResult(False, "outcome-brief", ("Missing bounded outcome marker",))
     data, errors = _read_sections(region, _OUTCOME_SECTION_ORDER)
+    missing = [name for name in _OUTCOME_SECTION_ORDER if name not in data]
+    compact = (
+        bool(missing)
+        and set(missing) <= set(_COMPACT_OPTIONAL_FIELDS)
+        and str(data.get("Status", "")).strip().upper() == OutcomeStatus.DONE.value
+    )
+    if compact:
+        errors = [error for error in errors if not error.startswith(_MISSING_FIELDS_PREFIX)]
+        for name in missing:
+            data[name] = "None" if name == "Human action" else ["None"]
+        data["Form"] = "compact"
 
     try:
         status = OutcomeStatus(str(data.get("Status", "")).strip().upper())
@@ -202,6 +225,14 @@ def validate_outcome(text: str) -> ValidationResult:
             errors.append("DONE cannot require human action")
         if not _empty(gaps):
             errors.append("DONE cannot contain unresolved gaps")
+        tags = [evidence_tag(item) for item in _evidence_items(proof)]
+        if any(result == "fail" for _, result in tags):
+            errors.append("DONE cannot include failing proof; use FAILED, BLOCKED, or REVIEW")
+        if not any(tag == ("direct", "pass") for tag in tags):
+            errors.append(
+                "DONE requires at least one [direct/pass] proof that you observed yourself; "
+                "use REVIEW when the evidence is derived or reported"
+            )
     if status in {OutcomeStatus.REVIEW, OutcomeStatus.DECIDE, OutcomeStatus.BLOCKED} and _empty(
         human_action
     ):
@@ -213,6 +244,13 @@ def validate_outcome(text: str) -> ValidationResult:
             errors.append(f"{status.value} requires a next action")
     if status is OutcomeStatus.DECIDE and _empty(open_items):
         errors.append("DECIDE requires an open decision")
+    elif status is OutcomeStatus.DECIDE and not any(
+        re.search(r"\brecommend", item, re.IGNORECASE) for item in _evidence_items(open_items)
+    ):
+        warnings.append(
+            "DECIDE should give a recommendation in Open, for example: "
+            "Options: A; B — Recommendation: A — Reversible: yes — Needed by: <date>"
+        )
 
     for name, limit in (("Proof", 5), ("Next", 3), ("Open", 3)):
         value = data.get(name)

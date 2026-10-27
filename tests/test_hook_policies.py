@@ -17,6 +17,7 @@ from briefspec.hooks import (
 )
 from briefspec.models import EventType, HookDecision, Runtime, RuntimeEvent, SessionState
 from briefspec.state import load_session, save_session
+from briefspec.work_types import type_profile
 
 NOW = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
 
@@ -126,7 +127,7 @@ def test_suggest_context_is_not_repeated_within_cooldown(
     assert state.last_suggested_at == NOW.isoformat()
 
 
-def test_suggest_context_repeats_after_cooldown_and_resets_on_checkpoint(
+def test_suggest_context_is_given_once_per_window_and_resets_on_checkpoint(
     isolated_homes: dict[str, Path],
     checkpoint_text: Callable[..., str],
 ) -> None:
@@ -139,21 +140,33 @@ def test_suggest_context_repeats_after_cooldown_and_resets_on_checkpoint(
         Runtime.CLAUDE,
         "PostToolUse",
         "recool",
-        timestamp=NOW + cooldown,
+        timestamp=NOW + cooldown * 3,
         tool_name="Edit",
     )
-    assert process_event(later, later_payload, config).context
+    assert process_event(later, later_payload, config).context is None
     stop, stop_payload = event(
         Runtime.CLAUDE,
         "Stop",
         "recool",
-        timestamp=NOW + cooldown + timedelta(minutes=1),
+        timestamp=NOW + cooldown * 3 + timedelta(minutes=1),
         last_assistant_message=checkpoint_text("orient"),
     )
     process_event(stop, stop_payload, config)
     state = load_session(Runtime.CLAUDE, "recool", NOW)
     assert not state.pending_checkpoint
     assert state.last_suggested_at is None
+    assert state.window_tool_base == state.tool_count
+    after_cooldown = NOW + cooldown * 5
+    for index in range(2):
+        tool, tool_payload = event(
+            Runtime.CLAUDE,
+            "PostToolUse",
+            "recool",
+            timestamp=after_cooldown + timedelta(seconds=index),
+            tool_name=f"Tool{index}",
+        )
+        result = process_event(tool, tool_payload, config)
+        assert (result.context is not None) is (index == 0)
 
 
 def test_auto_policy_requests_configured_checkpoint_mode_once(
@@ -370,7 +383,6 @@ def test_grok_native_repair_still_obeys_one_repair_guard(
         policy_config(),
     )
     assert second.action == "allow"
-    assert "repair guard allowed a still-invalid second stop" in second.diagnostics
 
 
 def _valid_outcome_body(
@@ -395,6 +407,161 @@ def _valid_outcome_body(
         "- None\n"
         "<!-- /briefspec -->"
     )
+
+
+@pytest.mark.parametrize(
+    ("runtime", "wrapper", "expected_action"),
+    [
+        (Runtime.CODEX, "missing", "block"),
+        (Runtime.CODEX, "matching", "allow"),
+        (Runtime.CODEX, "foreign", "block"),
+        (Runtime.GROK, "missing", "allow"),
+    ],
+)
+def test_terminal_typed_obligation(
+    isolated_homes: dict[str, Path],
+    outcome_text: Callable[..., str],
+    runtime: Runtime,
+    wrapper: str,
+    expected_action: str,
+) -> None:
+    config = policy_config(checkpoint="off", outcome="enforce")
+    prompt, payload = event(
+        runtime, "UserPromptSubmit", "terminal-typed", prompt="Implement the login endpoint."
+    )
+    process_event(prompt, payload, config)
+    state = load_session(runtime, "terminal-typed", NOW)
+    assistant = outcome_text()
+    if wrapper != "missing":
+        decision_id = (
+            state.classification_decision_id if wrapper == "matching" else "foreign-decision"
+        )
+        explanation = "\n".join(
+            f"### {section.label}\nCanonical content for {section.label}.\n"
+            for section in type_profile(state.work_type).sections
+        )
+        assistant = (
+            f"<!-- brief-spec:typed:v1 type={state.work_type} subject={state.subject} "
+            f"confidence={state.classification_confidence} origin={state.classification_origin} "
+            f"classified_at={state.classified_at} profile=1.0 decision_id={decision_id} -->\n"
+            f"{explanation}\n{assistant}\n<!-- /brief-spec -->"
+        )
+    stop, payload = event(
+        runtime,
+        "Stop",
+        "terminal-typed",
+        timestamp=NOW + timedelta(seconds=1),
+        last_assistant_message=assistant,
+    )
+    first = process_event(stop, payload, config)
+    assert first.action == expected_action
+    assert not first.diagnostics
+    if expected_action == "block":
+        assert first.reason and "brief-spec:typed:v1" in first.reason
+        second, payload = event(
+            runtime,
+            "Stop",
+            "terminal-typed",
+            timestamp=NOW + timedelta(seconds=2),
+            last_assistant_message=assistant,
+        )
+        assert process_event(second, payload, config).action == "allow"
+
+
+@pytest.mark.parametrize("runtime", [Runtime.CODEX, Runtime.GROK])
+@pytest.mark.parametrize(
+    ("requested", "supplied"),
+    [
+        ("teach", "orient"),
+        ("spoken", "teach"),
+        ("orient", None),
+        ("orient", "orient"),
+        ("teach", "teach"),
+        ("spoken", "spoken"),
+    ],
+)
+def test_terminal_requested_mode(
+    isolated_homes: dict[str, Path],
+    checkpoint_text: Callable[..., str],
+    outcome_text: Callable[..., str],
+    runtime: Runtime,
+    requested: str,
+    supplied: str | None,
+) -> None:
+    config = policy_config(checkpoint="suggest", outcome="off")
+    prompt, payload = event(
+        runtime,
+        "UserPromptSubmit",
+        "terminal-mode",
+        prompt=f"Review pull request #42. Close with a {requested} checkpoint.",
+    )
+    process_event(prompt, payload, config)
+    assistant = outcome_text()
+    if supplied is not None:
+        assistant += checkpoint_text(supplied)
+    stop, payload = event(
+        runtime,
+        "Stop",
+        "terminal-mode",
+        timestamp=NOW + timedelta(seconds=1),
+        last_assistant_message=assistant,
+    )
+    decision = process_event(stop, payload, config)
+    satisfied = requested == supplied
+    assert decision.action == ("allow" if satisfied else "block")
+    assert not decision.diagnostics
+    state = load_session(runtime, "terminal-mode", NOW)
+    assert state.pending_checkpoint is not satisfied
+    if satisfied:
+        assert state.last_checkpoint_at == (NOW + timedelta(seconds=1)).isoformat()
+    else:
+        assert state.last_checkpoint_at is None
+        assert "explicit-request" in state.pending_reasons
+        assert decision.reason and f"{requested} mode" in decision.reason
+        repaired, payload = event(
+            runtime,
+            "Stop",
+            "terminal-mode",
+            timestamp=NOW + timedelta(seconds=2),
+            last_assistant_message=checkpoint_text(requested),
+        )
+        assert process_event(repaired, payload, config).action == "allow"
+        assert not load_session(runtime, "terminal-mode", NOW).pending_checkpoint
+
+
+@pytest.mark.parametrize(
+    ("one_repair", "stop_hook_active"), [(True, False), (True, True), (False, False)]
+)
+def test_terminal_bounded_native_repair(
+    isolated_homes: dict[str, Path],
+    checkpoint_text: Callable[..., str],
+    outcome_text: Callable[..., str],
+    one_repair: bool,
+    stop_hook_active: bool,
+) -> None:
+    config = policy_config(one_repair=one_repair)
+    prompt, payload = event(
+        Runtime.GROK,
+        "UserPromptSubmit",
+        "terminal-native",
+        prompt="Review pull request #42. Close with a teach checkpoint.",
+    )
+    process_event(prompt, payload, config)
+    assistant = outcome_text() + checkpoint_text("orient")
+    for attempt in range(1, 4):
+        stop, payload = event(
+            Runtime.GROK,
+            "Stop",
+            "terminal-native",
+            timestamp=NOW + timedelta(seconds=attempt),
+            last_assistant_message=assistant,
+            stop_hook_active=stop_hook_active,
+        )
+        decision = process_event(stop, payload, config)
+        should_block = one_repair and not stop_hook_active and attempt == 1
+        assert decision.action == ("block" if should_block else "allow")
+        assert not any(item.startswith("fail-open:") for item in decision.diagnostics)
+        assert load_session(Runtime.GROK, "terminal-native", NOW).pending_checkpoint
 
 
 def test_grok_valid_outcome_without_typed_wrapper_does_not_continue(
@@ -743,3 +910,39 @@ def test_diagnostics_are_emitted_to_stderr(
         "brief-spec: first",
         "brief-spec: second",
     ]
+
+
+def test_reported_type_disagreement_is_kept_and_shown(
+    isolated_homes: dict[str, Path],
+    outcome_text: Callable[..., str],
+) -> None:
+    config = policy_config()
+    prompt, payload = event(
+        Runtime.CLAUDE, "UserPromptSubmit", "disagree", prompt="Implement the login endpoint."
+    )
+    process_event(prompt, payload, config)
+    state = load_session(Runtime.CLAUDE, "disagree", NOW)
+    assert state.work_type == "implementation"
+    explanation = "\n".join(
+        f"### {section.label}\nContent for {section.label}.\n"
+        for section in type_profile("review").sections
+    )
+    assistant = (
+        f"<!-- brief-spec:typed:v1 type=review subject={state.subject} "
+        f"confidence={state.classification_confidence} origin={state.classification_origin} "
+        f"classified_at={state.classified_at} profile=1.0 "
+        f"decision_id={state.classification_decision_id} -->\n"
+        f"{explanation}\n{outcome_text()}\n<!-- /brief-spec -->"
+    )
+    stop, payload = event(
+        Runtime.CLAUDE,
+        "Stop",
+        "disagree",
+        timestamp=NOW + timedelta(seconds=1),
+        last_assistant_message=assistant,
+    )
+    decision = process_event(stop, payload, config)
+    assert decision.notice == (
+        "Brief-Spec: the brief calls this review work; the classifier chose implementation."
+    )
+    assert load_session(Runtime.CLAUDE, "disagree", NOW).reported_work_type == "review"

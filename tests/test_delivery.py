@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -9,11 +11,14 @@ import pytest
 from briefspec.bundle import build_delivery_bundle, deliver_bundle
 from briefspec.cli import main
 from briefspec.delivery import (
+    CORE_FORMATS,
     canonical_json_bytes,
+    canonical_sha256,
     export_core,
     load_delivery,
     render_html,
     render_markdown,
+    render_phone,
     render_spoken_text,
     validate_delivery,
 )
@@ -104,6 +109,93 @@ def test_markdown_json_and_html_share_one_canonical_delivery(tmp_path: Path) -> 
         workspace=ROOT,
     )
     assert result["status"] == "PASS", result
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        (
+            '<h2 id="field-outcome">Outcome</h2><p>Canonical delivery is implemented.</p>',
+            '<h2 id="field-outcome">Outcome</h2><p>Unverified replacement outcome.</p>',
+        ),
+        ("<h1>Canonical delivery is implemented.</h1>", "<h1>Contradictory headline</h1>"),
+        ("[direct/pass kind=file]", "[reported/fail kind=file]"),
+        ("</main>", "<p>Additional unsupported report content.</p></main>"),
+        ("</style>", "#field-outcome + p {display:none}</style>"),
+    ],
+    ids=["outcome", "headline", "proof", "injected-content", "hidden-outcome"],
+)
+def test_standalone_html_visible_tamper(tmp_path: Path, original: str, replacement: str) -> None:
+    delivery = _delivery()
+    rendered = render_html(delivery)
+    assert original in rendered
+    target = tmp_path / "brief.html"
+    target.write_text(rendered.replace(original, replacement, 1), encoding="utf-8")
+
+    result = verify_target(target, level=VerificationLevel.RENDERED, workspace=ROOT)
+
+    assert result["status"] == "FAIL", result
+    assert any(
+        check["name"] == "HTML integrity" and check["status"] == "PASS"
+        for check in result["checks"]
+    ), result
+
+
+@pytest.mark.parametrize(
+    "variant", ["non-object", "unsupported-schema", "invalid-proof", "malformed-classification"]
+)
+def test_standalone_html_invalid_canonical(tmp_path: Path, variant: str) -> None:
+    delivery = _delivery()
+    rendered = render_html(delivery)
+    original_digest = canonical_sha256(delivery)
+    original_payload = html.escape(canonical_json_bytes(delivery).decode("utf-8"))
+    if variant == "non-object":
+        delivery = None
+    elif variant == "unsupported-schema":
+        delivery["schema_version"] = "999"
+    elif variant == "invalid-proof":
+        delivery["brief"]["proof"][0]["basis"] = "reported"
+    else:
+        delivery["classification"]["work_type"] = []
+    # Keep the embedded payload and every declared hash consistent with the invalid input.
+    rendered = rendered.replace(
+        f"<pre>{original_payload}</pre>",
+        f"<pre>{html.escape(canonical_json_bytes(delivery).decode('utf-8'))}</pre>",
+    ).replace(original_digest, canonical_sha256(delivery))
+    target = tmp_path / "brief.html"
+    target.write_text(rendered, encoding="utf-8")
+
+    result = verify_target(target, level=VerificationLevel.RENDERED, workspace=ROOT)
+
+    assert result["status"] == "FAIL", result
+    assert any(
+        check["name"] == "structure" and check["status"] == "FAIL" for check in result["checks"]
+    ), result
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        OUTCOME,
+        SPOKEN,
+        OUTCOME.replace(
+            "Canonical delivery is implemented.", 'Escaped <report> & "quotes" — café.'
+        ),
+    ],
+    ids=["outcome", "spoken", "escaped-unicode"],
+)
+def test_standalone_html_valid_projection(tmp_path: Path, text: str) -> None:
+    delivery = _delivery(text)
+    target = tmp_path / "brief.html"
+    target.write_text(render_html(delivery), encoding="utf-8")
+
+    result = verify_target(target, level=VerificationLevel.RENDERED, workspace=ROOT)
+
+    assert result["status"] in {"PASS", "WARN"}, result
+    assert any(
+        check["name"] == "HTML rendering" and check["status"] == "PASS"
+        for check in result["checks"]
+    ), result
 
 
 def test_bundle_is_deterministic_and_manifest_is_verified(tmp_path: Path) -> None:
@@ -198,3 +290,138 @@ def test_validate_accepts_new_path_first_form(
     source.write_text(OUTCOME, encoding="utf-8")
     assert main(["validate", str(source), "--strict"]) == 0
     assert "VALID" in capsys.readouterr().out
+
+
+PHONE_OUTCOME = """<!-- briefspec:outcome:v1 -->
+Status: REVIEW
+Outcome: The phone format is ready to read.
+Human action: Approve the format change.
+Proof:
+- [direct/pass kind=file] Contract test at `tests/test_delivery.py`
+Gaps:
+- Not tried on a real phone.
+Next:
+- Merge after review.
+- Tag later.
+Open:
+- None
+<!-- /briefspec -->
+"""
+
+
+PHONE_ORIENT = """<!-- briefspec:checkpoint:v1 mode=orient -->
+Headline: Halfway through the phone work.
+Current state: The renderer is written.
+Completed:
+- Phone renderer
+Decisions:
+- None
+Proof:
+- [direct/pass kind=test] `pytest tests/test_delivery.py` passed
+Next:
+- Review the PR
+Open:
+- None
+<!-- /briefspec -->
+"""
+
+
+def test_phone_render_leads_with_answer_and_trims_the_outcome_brief() -> None:
+    delivery = _delivery(PHONE_OUTCOME)
+    assert validate_delivery(delivery).valid
+    phone = render_phone(delivery)
+    blocks = [block for block in phone.split("\n\n") if block.strip()]
+
+    assert blocks[0] == "The phone format is ready to read."
+
+    table_rows = [line for line in phone.splitlines() if line.lstrip().startswith("|")]
+    assert all(line.strip("| ").count("|") + 1 <= 2 for line in table_rows)
+
+    assert re.findall(r"^\*\*(.+?):\*\*", phone, re.MULTILINE) == [
+        "Status",
+        "Human action",
+        "Next",
+    ]
+    assert "**Status:** REVIEW" in phone
+    assert "**Human action:** Approve the format change." in phone
+    assert "- Merge after review.\n- Tag later." in phone
+    for dropped in ("Proof", "Gaps", "Open", "Rationale", "Type:", "Delivery context", "<!--"):
+        assert dropped not in phone
+
+    checkpoint = render_phone(_delivery(PHONE_ORIENT))
+    assert [block for block in checkpoint.split("\n\n") if block.strip()][0] == (
+        "Halfway through the phone work."
+    )
+    assert (
+        "**Proof:**\n- [direct/pass kind=test] `pytest tests/test_delivery.py` passed" in checkpoint
+    )
+    assert not [line for line in checkpoint.splitlines() if line.lstrip().startswith("|")]
+    assert "<!--" not in checkpoint
+
+
+def test_phone_is_an_additive_core_format() -> None:
+    assert CORE_FORMATS["phone"] == ("brief.phone.md", "text/markdown")
+    assert list(CORE_FORMATS)[:3] == ["markdown", "json", "html"]
+
+
+def test_export_selects_phone_and_bundle_adds_it_to_the_required_formats(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "outcome.md"
+    source.write_text(PHONE_OUTCOME, encoding="utf-8")
+    output_dir = tmp_path / "out"
+    assert (
+        main(
+            [
+                "export",
+                str(source),
+                "--formats",
+                "phone",
+                "--output-dir",
+                str(output_dir),
+                "--created-at",
+                "2026-08-11T12:00:00Z",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    outputs = json.loads(capsys.readouterr().out)["outputs"]
+    assert [(item["format"], item["media_type"]) for item in outputs] == [
+        ("phone", "text/markdown")
+    ]
+    assert [path.name for path in output_dir.iterdir()] == ["brief.phone.md"]
+
+    bundle = tmp_path / "delivery.zip"
+    assert (
+        main(
+            [
+                "bundle",
+                str(source),
+                "--formats",
+                "markdown,json,html,phone",
+                "--output",
+                str(bundle),
+                "--created-at",
+                "2026-08-11T12:00:00Z",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    with zipfile.ZipFile(bundle) as archive:
+        names = set(archive.namelist())
+        phone = archive.read("brief.phone.md").decode("utf-8")
+    assert names == {"brief.md", "brief.json", "brief.html", "brief.phone.md", "manifest.json"}
+    assert phone.startswith("The phone format is ready to read.\n")
+    assert main(["verify", str(bundle), "--level", "rendered", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "PASS"
+
+
+def test_default_bundle_does_not_require_phone(tmp_path: Path) -> None:
+    bundle = tmp_path / "delivery.zip"
+    build_delivery_bundle(_delivery(), bundle)
+    with zipfile.ZipFile(bundle) as archive:
+        assert "brief.phone.md" not in archive.namelist()
